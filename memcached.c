@@ -2660,7 +2660,7 @@ static void process_stats_conns(ADD_STAT add_stats, void *c) {
 
     for (i = 0; i < max_fds; i++) {
         /* This is safe to do unlocked because conns are never freed. */
-        if (conns[i]) {
+        if (conns[i] && conns[i]->state != conn_closed) {
             if (conns[i]->transport == tcp_transport) {
                 char addr_text[128];
 
