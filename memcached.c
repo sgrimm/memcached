@@ -406,7 +406,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         c->request_addr_size = 0;
     }
 
-    if (transport == tcp_transport) {
+    if (transport == tcp_transport && init_state == conn_new_cmd) {
         if (getpeername(sfd, &c->request_addr, &c->request_addr_size)) {
             perror("getpeername");
             memset(&c->request_addr, 0, sizeof(c->request_addr));
