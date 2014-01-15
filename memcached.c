@@ -102,12 +102,14 @@ static void conn_free(conn *c);
 struct stats stats;
 struct settings settings;
 time_t process_started;     /* when the process was started */
+conn **conns;
 
 struct slab_rebalance slab_rebal;
 volatile int slab_rebalance_signal;
 
 /** file scope variables **/
 static conn *listen_conn = NULL;
+static int max_fds;
 static struct event_base *main_base;
 
 enum transmit_result {
@@ -280,66 +282,41 @@ static int add_msghdr(conn *c)
     return 0;
 }
 
+extern pthread_mutex_t conn_lock;
 
 /*
- * Free list management for connections.
+ * Initializes the connections array. We don't actually allocate connection
+ * structures until they're needed, so as to avoid wasting memory when the
+ * maximum connection count is much higher than the actual number of
+ * connections.
+ *
+ * This does end up wasting a few pointers' worth of memory for FDs that are
+ * used for things other than connections, but that's worth it in exchange for
+ * being able to directly index the conns array by FD.
  */
-
-static conn **freeconns;
-static int freetotal;
-static int freecurr;
-/* Lock for connection freelist */
-static pthread_mutex_t conn_lock = PTHREAD_MUTEX_INITIALIZER;
-
-
 static void conn_init(void) {
-    freetotal = 200;
-    freecurr = 0;
-    if ((freeconns = calloc(freetotal, sizeof(conn *))) == NULL) {
+    /* We're unlikely to see an FD much higher than maxconns. */
+    int next_fd = dup(1);
+    int headroom = 10;      /* account for extra unexpected open FDs */
+    struct rlimit rl;
+
+    max_fds = settings.maxconns + headroom + next_fd;
+
+    /* But if possible, get the actual highest FD we can possibly ever see. */
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        max_fds = rl.rlim_max;
+    } else {
+        fprintf(stderr, "Failed to query maximum file descriptor; "
+                        "falling back to maxconns\n");
+    }
+
+    close(next_fd);
+
+    if ((conns = calloc(max_fds, sizeof(conn *))) == NULL) {
         fprintf(stderr, "Failed to allocate connection structures\n");
+        /* This is unrecoverable so bail out early. */
+        exit(1);
     }
-    return;
-}
-
-/*
- * Returns a connection from the freelist, if any.
- */
-conn *conn_from_freelist() {
-    conn *c;
-
-    pthread_mutex_lock(&conn_lock);
-    if (freecurr > 0) {
-        c = freeconns[--freecurr];
-    } else {
-        c = NULL;
-    }
-    pthread_mutex_unlock(&conn_lock);
-
-    return c;
-}
-
-/*
- * Adds a connection to the freelist. 0 = success.
- */
-bool conn_add_to_freelist(conn *c) {
-    bool ret = true;
-    pthread_mutex_lock(&conn_lock);
-    if (freecurr < freetotal) {
-        freeconns[freecurr++] = c;
-        ret = false;
-    } else {
-        /* try to enlarge free connections array */
-        size_t newsize = freetotal * 2;
-        conn **new_freeconns = realloc(freeconns, sizeof(conn *) * newsize);
-        if (new_freeconns) {
-            freetotal = newsize;
-            freeconns = new_freeconns;
-            freeconns[freecurr++] = c;
-            ret = false;
-        }
-    }
-    pthread_mutex_unlock(&conn_lock);
-    return ret;
 }
 
 static const char *prot_text(enum protocol prot) {
@@ -362,7 +339,10 @@ conn *conn_new(const int sfd, enum conn_states init_state,
                 const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
                 struct event_base *base) {
-    conn *c = conn_from_freelist();
+    conn *c;
+    
+    assert(sfd >= 0 && sfd < max_fds);
+    c = conns[sfd];
 
     if (NULL == c) {
         if (!(c = (conn *)calloc(1, sizeof(conn)))) {
@@ -409,6 +389,9 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         STATS_LOCK();
         stats.conn_structs++;
         STATS_UNLOCK();
+
+        c->sfd = sfd;
+        conns[sfd] = c;
     }
 
     c->transport = transport;
@@ -421,6 +404,13 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         c->request_addr_size = sizeof(c->request_addr);
     } else {
         c->request_addr_size = 0;
+    }
+
+    if (transport == tcp_transport) {
+        if (getpeername(sfd, &c->request_addr, &c->request_addr_size)) {
+            perror("getpeername");
+            memset(&c->request_addr, 0, sizeof(c->request_addr));
+        }
     }
 
     if (settings.verbose > 1) {
@@ -443,7 +433,6 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         }
     }
 
-    c->sfd = sfd;
     c->state = init_state;
     c->rlbytes = 0;
     c->cmd = -1;
@@ -471,9 +460,6 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->ev_flags = event_flags;
 
     if (event_add(&c->event, 0) == -1) {
-        if (conn_add_to_freelist(c)) {
-            conn_free(c);
-        }
         perror("event_add");
         return NULL;
     }
@@ -540,7 +526,11 @@ static void conn_cleanup(conn *c) {
  */
 void conn_free(conn *c) {
     if (c) {
+        assert(c != NULL);
+        assert(c->sfd >= 0 && c->sfd < max_fds);
+
         MEMCACHED_CONN_DESTROY(c);
+        conns[c->sfd] = NULL;
         if (c->hdrbuf)
             free(c->hdrbuf);
         if (c->msglist)
@@ -568,17 +558,15 @@ static void conn_close(conn *c) {
     if (settings.verbose > 1)
         fprintf(stderr, "<%d connection closed.\n", c->sfd);
 
+    conn_cleanup(c);
+
     MEMCACHED_CONN_RELEASE(c->sfd);
     close(c->sfd);
+    conn_set_state(c, conn_closed);
+
     pthread_mutex_lock(&conn_lock);
     allow_new_conns = true;
     pthread_mutex_unlock(&conn_lock);
-    conn_cleanup(c);
-
-    /* if the connection has big buffers, just free it */
-    if (c->rsize > READ_BUFFER_HIGHWAT || conn_add_to_freelist(c)) {
-        conn_free(c);
-    }
 
     STATS_LOCK();
     stats.curr_conns--;
@@ -658,7 +646,8 @@ static const char *state_text(enum conn_states state) {
                                        "conn_nread",
                                        "conn_swallow",
                                        "conn_closing",
-                                       "conn_mwrite" };
+                                       "conn_mwrite",
+                                       "conn_closed" };
     return statenames[state];
 }
 
@@ -2661,6 +2650,38 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("flush_enabled", "%s", settings.flush_enabled ? "yes" : "no");
 }
 
+static void process_stats_conns(ADD_STAT add_stats, void *c) {
+    int i;
+    char key_str[STAT_KEY_LEN];
+    char val_str[STAT_VAL_LEN];
+    int klen = 0, vlen = 0;
+
+    assert(add_stats);
+
+    for (i = 0; i < max_fds; i++) {
+        /* This is safe to do unlocked because conns are never freed. */
+        if (conns[i]) {
+            if (conns[i]->transport == tcp_transport) {
+                char addr_text[128];
+
+                /* OS X doesn't include inet_ntoa_r, so do it by hand */
+                struct sockaddr_in *sin;
+                sin = (struct sockaddr_in *)&conns[i]->request_addr;
+                uint8_t *sin_addr = (uint8_t *)&sin->sin_addr;
+                sprintf(addr_text, "%u.%u.%u.%u:%d",
+                        sin_addr[0], sin_addr[1], sin_addr[2], sin_addr[3],
+                        ntohs(sin->sin_port));
+                APPEND_NUM_STAT(i, "addr", "%s", addr_text);
+            }
+
+            APPEND_NUM_STAT(i, "state", "%s",
+                    state_text(conns[i]->state));
+            APPEND_NUM_STAT(i, "secs_since_last_cmd", "%d",
+                    current_time - conns[i]->last_cmd_time);
+        }
+    }
+}
+
 static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
     const char *subcommand = tokens[SUBCOMMAND_TOKEN].value;
     assert(c != NULL);
@@ -2710,6 +2731,8 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
         buf = item_cachedump(id, limit, &bytes);
         write_and_free(c, buf, bytes);
         return ;
+    } else if (strcmp(subcommand, "conns") == 0) {
+        process_stats_conns(&append_stats, c);
     } else {
         /* getting here means that the subcommand is either engine specific or
            is invalid. query the engine and see. */
@@ -3592,6 +3615,8 @@ static int try_read_command(conn *c) {
         assert(c->rcurr <= (c->rbuf + c->rsize));
     }
 
+    c->last_cmd_time = current_time;
+
     return 1;
 }
 
@@ -4144,6 +4169,7 @@ static void drive_machine(conn *c) {
             stop = true;
             break;
 
+        case conn_closed:
         case conn_max_state:
             assert(false);
             break;
