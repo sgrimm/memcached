@@ -3607,6 +3607,7 @@ static int try_read_command(conn *c) {
 
         assert(cont <= (c->rcurr + c->rbytes));
 
+        c->last_cmd_time = current_time;
         process_command(c, c->rcurr);
 
         c->rbytes -= (cont - c->rcurr);
@@ -3614,8 +3615,6 @@ static int try_read_command(conn *c) {
 
         assert(c->rcurr <= (c->rbuf + c->rsize));
     }
-
-    c->last_cmd_time = current_time;
 
     return 1;
 }
