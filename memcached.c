@@ -2662,16 +2662,36 @@ static void process_stats_conns(ADD_STAT add_stats, void *c) {
         /* This is safe to do unlocked because conns are never freed. */
         if (conns[i] && conns[i]->state != conn_closed) {
             if (conns[i]->transport == tcp_transport) {
-                char addr_text[128];
+                char addr_text[INET6_ADDRSTRLEN + sizeof("[:XXXXX]")];
+                const char *result = NULL;
+                struct sockaddr *addr = &conns[i]->request_addr;
+                int af = addr->sa_family;
+                unsigned short port;
 
-                /* OS X doesn't include inet_ntoa_r, so do it by hand */
-                struct sockaddr_in *sin;
-                sin = (struct sockaddr_in *)&conns[i]->request_addr;
-                uint8_t *sin_addr = (uint8_t *)&sin->sin_addr;
-                sprintf(addr_text, "%u.%u.%u.%u:%d",
-                        sin_addr[0], sin_addr[1], sin_addr[2], sin_addr[3],
-                        ntohs(sin->sin_port));
-                APPEND_NUM_STAT(i, "addr", "%s", addr_text);
+                switch (af) {
+                    case AF_INET:
+                        result = inet_ntop(af,
+                                &((struct sockaddr_in *)addr)->sin_addr,
+                                addr_text,
+                                sizeof(addr_text) - 1);
+                        port = ntohs(((struct sockaddr_in *)addr)->sin_port);
+                        break;
+
+                    case AF_INET6:
+                        addr_text[0] = '[';
+                        result = inet_ntop(af,
+                                &((struct sockaddr_in6 *)addr)->sin6_addr,
+                                addr_text + 1,
+                                sizeof(addr_text) - 2);
+                        strcat(addr_text, "]");
+                        port = ntohs(((struct sockaddr_in6 *)addr)->sin6_port);
+                        break;
+                }
+
+                if (result != NULL) {
+                    sprintf(addr_text + strlen(addr_text), ":%u", port);
+                    APPEND_NUM_STAT(i, "addr", "%s", addr_text);
+                }
             }
 
             APPEND_NUM_STAT(i, "state", "%s",
