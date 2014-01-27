@@ -340,7 +340,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
                 const int read_buffer_size, enum network_transport transport,
                 struct event_base *base) {
     conn *c;
-    
+
     assert(sfd >= 0 && sfd < max_fds);
     c = conns[sfd];
 
