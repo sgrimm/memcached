@@ -407,7 +407,8 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     }
 
     if (transport == tcp_transport && init_state == conn_new_cmd) {
-        if (getpeername(sfd, &c->request_addr, &c->request_addr_size)) {
+        if (getpeername(sfd, (struct sockaddr *) &c->request_addr,
+                        &c->request_addr_size)) {
             perror("getpeername");
             memset(&c->request_addr, 0, sizeof(c->request_addr));
         }
@@ -2664,7 +2665,7 @@ static void process_stats_conns(ADD_STAT add_stats, void *c) {
             if (conns[i]->transport == tcp_transport) {
                 char addr_text[INET6_ADDRSTRLEN + sizeof("[:XXXXX]")];
                 const char *result = NULL;
-                struct sockaddr *addr = &conns[i]->request_addr;
+                struct sockaddr *addr = (void *)&conns[i]->request_addr;
                 int af = addr->sa_family;
                 unsigned short port;
 
