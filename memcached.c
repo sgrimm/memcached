@@ -2662,12 +2662,29 @@ static void process_stats_conns(ADD_STAT add_stats, void *c) {
     for (i = 0; i < max_fds; i++) {
         /* This is safe to do unlocked because conns are never freed. */
         if (conns[i] && conns[i]->state != conn_closed) {
-            if (conns[i]->transport == tcp_transport) {
+            if (conns[i]->transport == tcp_transport ||
+                    IS_UDP(conns[i]->transport)) {
                 char addr_text[INET6_ADDRSTRLEN + sizeof("[:XXXXX]")];
                 const char *result = NULL;
+                struct sockaddr_in6 local_addr;
                 struct sockaddr *addr = (void *)&conns[i]->request_addr;
-                int af = addr->sa_family;
+                int af;
                 unsigned short port;
+
+                /* For listen ports and idle UDP ports, show listen address */
+                if (conns[i]->state == conn_listening ||
+                        (IS_UDP(conns[i]->transport) &&
+                         conns[i]->state == conn_read)) {
+                    socklen_t local_addr_len = sizeof(local_addr);
+
+                    if (getsockname(conns[i]->sfd,
+                                (struct sockaddr *)&local_addr,
+                                &local_addr_len) == 0) {
+                        addr = (struct sockaddr *)&local_addr;
+                    }
+                }
+
+                af = addr->sa_family;
 
                 switch (af) {
                     case AF_INET:
@@ -2690,7 +2707,9 @@ static void process_stats_conns(ADD_STAT add_stats, void *c) {
                 }
 
                 if (result != NULL) {
-                    sprintf(addr_text + strlen(addr_text), ":%u", port);
+                    sprintf(addr_text + strlen(addr_text), ":%u %s",
+                            port,
+                            IS_UDP(conns[i]->transport) ? "udp" : "tcp");
                     APPEND_NUM_STAT(i, "addr", "%s", addr_text);
                 }
             }
