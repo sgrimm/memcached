@@ -4397,8 +4397,17 @@ static int server_socket(const char *interface,
             int c;
 
             for (c = 0; c < settings.num_threads_per_udp; c++) {
-                /* this is guaranteed to hit all threads because we round-robin */
-                dispatch_conn_new(sfd, conn_read, EV_READ | EV_PERSIST,
+                /* Allocate one UDP file descriptor per worker thread;
+                 * this allows "stats conns" to separately list multiple
+                 * parallel UDP requests in progress.
+                 *
+                 * The dispatch code round-robins new connection requests
+                 * among threads, so this is guaranteed to assign one
+                 * FD to each thread.
+                 */
+                int per_thread_fd = c ? dup(sfd) : sfd;
+                dispatch_conn_new(per_thread_fd, conn_read,
+                                  EV_READ | EV_PERSIST,
                                   UDP_READ_BUFFER_SIZE, transport);
             }
         } else {
