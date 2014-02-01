@@ -4234,7 +4234,9 @@ void event_handler(const int fd, const short which, void *arg) {
         return;
     }
 
+    thread_set_conn(c);
     drive_machine(c);
+    thread_set_conn(NULL);
 
     /* wait for next event */
     return;

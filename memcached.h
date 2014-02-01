@@ -562,6 +562,9 @@ void threadlocal_stats_reset(void);
 void threadlocal_stats_aggregate(struct thread_stats *stats);
 void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out);
 
+conn *thread_get_conn(void);
+void  thread_set_conn(conn *);
+
 /* Stat processing functions */
 void append_stat(const char *name, ADD_STAT add_stats, conn *c,
                  const char *fmt, ...);

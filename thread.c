@@ -63,6 +63,9 @@ static pthread_mutex_t item_global_lock;
 /* thread-specific variable for deeply finding the item lock type */
 static pthread_key_t item_lock_type_key;
 
+/* thread-specific variable to hold the connection currently being processed */
+static pthread_key_t current_conn_key;
+
 static LIBEVENT_DISPATCHER_THREAD dispatcher_thread;
 
 /*
@@ -483,6 +486,20 @@ int is_listen_thread() {
     return pthread_self() == dispatcher_thread.thread_id;
 }
 
+/*
+ * Returns the connection currently being serviced by this thread.
+ */
+conn *thread_get_conn() {
+    return (conn *)pthread_getspecific(current_conn_key);
+}
+
+/*
+ * Sets the connection currently being serviced by this thread.
+ */
+void thread_set_conn(conn *c) {
+    pthread_setspecific(current_conn_key, c);
+}
+
 /********************************* ITEM ACCESS *******************************/
 
 /*
@@ -814,6 +831,8 @@ void thread_init(int nthreads, struct event_base *main_base) {
     }
     pthread_key_create(&item_lock_type_key, NULL);
     pthread_mutex_init(&item_global_lock, NULL);
+
+    pthread_key_create(&current_conn_key, NULL);
 
     threads = calloc(nthreads, sizeof(LIBEVENT_THREAD));
     if (! threads) {
