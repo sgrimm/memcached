@@ -23,6 +23,10 @@
 
 #include "sasl_defs.h"
 
+/** If defined, turn on tracking of refs owned by each connection and
+    output debug messages if there are refs held at unexpected times. */
+#define REF_LEAK_TRACING
+
 /** Maximum length of a key. */
 #define KEY_MAX_LENGTH 250
 
@@ -184,6 +188,11 @@ enum network_transport {
 enum item_lock_types {
     ITEM_LOCK_GRANULAR = 0,
     ITEM_LOCK_GLOBAL
+};
+
+enum refcount_type {
+    REFCOUNT_CLIENT,
+    REFCOUNT_HASHTABLE
 };
 
 #define IS_UDP(x) (x == udp_transport)
@@ -387,6 +396,7 @@ struct conn {
 
     char   *rbuf;   /** buffer to read commands into */
     char   *rcurr;  /** but if we parsed some already, this is where we stopped */
+    char   *rlast;  /** start of last complete command */
     int    rsize;   /** total allocated size of rbuf */
     int    rbytes;  /** how much data, starting from rcur, do we have unparsed */
 
@@ -462,6 +472,12 @@ struct conn {
     int keylen;
     conn   *next;     /* Used for generating a list of conn structures */
     LIBEVENT_THREAD *thread; /* Pointer to the thread object serving this connection */
+
+#ifdef REF_LEAK_TRACING
+    /* data for tracking open references to cache objects */
+    int num_open_refs;
+#endif
+
 };
 
 /* array of conn structures, indexed by file descriptor */
@@ -539,7 +555,7 @@ void  item_flush_expired(void);
 item *item_get(const char *key, const size_t nkey);
 item *item_touch(const char *key, const size_t nkey, uint32_t exptime);
 int   item_link(item *it);
-void  item_remove(item *it);
+void  item_remove(item *it, enum refcount_type type);
 int   item_replace(item *it, item *new_it, const uint32_t hv);
 void  item_stats(ADD_STAT add_stats, void *c);
 void  item_stats_totals(ADD_STAT add_stats, void *c);
@@ -554,8 +570,8 @@ void *item_trylock(uint32_t hv);
 void item_trylock_unlock(void *arg);
 void item_unlock(uint32_t hv);
 void switch_item_lock_type(enum item_lock_types type);
-unsigned short refcount_incr(unsigned short *refcount);
-unsigned short refcount_decr(unsigned short *refcount);
+unsigned short refcount_incr(item *it, enum refcount_type type);
+unsigned short refcount_decr(item *it, enum refcount_type type);
 void STATS_LOCK(void);
 void STATS_UNLOCK(void);
 void threadlocal_stats_reset(void);

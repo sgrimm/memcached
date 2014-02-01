@@ -57,8 +57,8 @@ uint64_t get_cas_id(void) {
 /* Enable this for reference-count debugging. */
 #if 0
 # define DEBUG_REFCNT(it,op) \
-                fprintf(stderr, "item %x refcnt(%c) %d %c%c%c\n", \
-                        it, op, it->refcount, \
+                fprintf(stderr, "item %llx refcnt(%c) %d %c%c\n", \
+                        (unsigned long long) it, op, it->refcount, \
                         (it->it_flags & ITEM_LINKED) ? 'L' : ' ', \
                         (it->it_flags & ITEM_SLABBED) ? 'S' : ' ')
 #else
@@ -120,8 +120,8 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
         if (hv != cur_hv && (hold_lock = item_trylock(hv)) == NULL)
             continue;
         /* Now see if the item is refcount locked */
-        if (refcount_incr(&search->refcount) != 2) {
-            refcount_decr(&search->refcount);
+        if (refcount_incr(search, REFCOUNT_CLIENT) != 2) {
+            refcount_decr(search, REFCOUNT_CLIENT);
             /* Old rare bug could cause a refcount leak. We haven't seen
              * it in years, but we leave this code in to prevent failures
              * just in case */
@@ -177,7 +177,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
             }
         }
 
-        refcount_decr(&search->refcount);
+        refcount_decr(search, REFCOUNT_CLIENT);
         /* If hash values were equal, we don't grab a second lock */
         if (hold_lock)
             item_trylock_unlock(hold_lock);
@@ -199,7 +199,8 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     /* Item initialization can happen outside of the lock; the item's already
      * been removed from the slab LRU.
      */
-    it->refcount = 1;     /* the caller will have a reference */
+    it->refcount = 0;
+    refcount_incr(it, REFCOUNT_CLIENT);
     mutex_unlock(&cache_lock);
     it->next = it->prev = it->h_next = 0;
     it->slabs_clsid = id;
@@ -305,7 +306,7 @@ int do_item_link(item *it, const uint32_t hv) {
     ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
     assoc_insert(it, hv);
     item_link_q(it);
-    refcount_incr(&it->refcount);
+    refcount_incr(it, REFCOUNT_HASHTABLE);
     mutex_unlock(&cache_lock);
 
     return 1;
@@ -322,7 +323,7 @@ void do_item_unlink(item *it, const uint32_t hv) {
         STATS_UNLOCK();
         assoc_delete(ITEM_key(it), it->nkey, hv);
         item_unlink_q(it);
-        do_item_remove(it);
+        do_item_remove(it, REFCOUNT_HASHTABLE);
     }
     mutex_unlock(&cache_lock);
 }
@@ -338,16 +339,16 @@ void do_item_unlink_nolock(item *it, const uint32_t hv) {
         STATS_UNLOCK();
         assoc_delete(ITEM_key(it), it->nkey, hv);
         item_unlink_q(it);
-        do_item_remove(it);
+        do_item_remove(it, REFCOUNT_HASHTABLE);
     }
 }
 
-void do_item_remove(item *it) {
+void do_item_remove(item *it, enum refcount_type type) {
     MEMCACHED_ITEM_REMOVE(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & ITEM_SLABBED) == 0);
     assert(it->refcount > 0);
 
-    if (refcount_decr(&it->refcount) == 0) {
+    if (refcount_decr(it, type) == 0) {
         item_free(it);
     }
 }
@@ -523,14 +524,14 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
     //mutex_lock(&cache_lock);
     item *it = assoc_find(key, nkey, hv);
     if (it != NULL) {
-        refcount_incr(&it->refcount);
+        refcount_incr(it, REFCOUNT_CLIENT);
         /* Optimization for slab reassignment. prevents popular items from
          * jamming in busy wait. Can only do this here to satisfy lock order
          * of item_lock, cache_lock, slabs_lock. */
         if (slab_rebalance_signal &&
             ((void *)it >= slab_rebal.slab_start && (void *)it < slab_rebal.slab_end)) {
             do_item_unlink_nolock(it, hv);
-            do_item_remove(it);
+            do_item_remove(it, REFCOUNT_CLIENT);
             it = NULL;
         }
     }
@@ -554,14 +555,14 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
         if (settings.oldest_live != 0 && settings.oldest_live <= current_time &&
             it->time <= settings.oldest_live) {
             do_item_unlink(it, hv);
-            do_item_remove(it);
+            do_item_remove(it, REFCOUNT_CLIENT);
             it = NULL;
             if (was_found) {
                 fprintf(stderr, " -nuked by flush");
             }
         } else if (it->exptime != 0 && it->exptime <= current_time) {
             do_item_unlink(it, hv);
-            do_item_remove(it);
+            do_item_remove(it, REFCOUNT_CLIENT);
             it = NULL;
             if (was_found) {
                 fprintf(stderr, " -nuked by expire");

@@ -79,6 +79,11 @@ static void server_stats(ADD_STAT add_stats, conn *c);
 static void process_stat_settings(ADD_STAT add_stats, void *c);
 static void conn_to_str(const conn *c, char *buf);
 
+#define CONN_TO_STR_BUF_SIZE (INET6_ADDRSTRLEN + sizeof("tcp:[]:XXXXX"))
+
+#ifdef REF_LEAK_TRACING
+static void conn_check_open_refs(const conn *c);
+#endif
 
 /* defaults */
 static void settings_init(void);
@@ -441,6 +446,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->rbytes = c->wbytes = 0;
     c->wcurr = c->wbuf;
     c->rcurr = c->rbuf;
+    c->rlast = NULL;
     c->ritem = 0;
     c->icurr = c->ilist;
     c->suffixcurr = c->suffixlist;
@@ -450,6 +456,10 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->msgcurr = 0;
     c->msgused = 0;
     c->authenticated = false;
+
+#ifdef REF_LEAK_TRACING
+    c->num_open_refs = 0;
+#endif
 
     c->write_and_go = init_state;
     c->write_and_free = 0;
@@ -480,14 +490,14 @@ static void conn_release_items(conn *c) {
     assert(c != NULL);
 
     if (c->item) {
-        item_remove(c->item);
+        item_remove(c->item, REFCOUNT_CLIENT);
         c->item = 0;
     }
 
     while (c->ileft > 0) {
         item *it = *(c->icurr);
         assert((it->it_flags & ITEM_SLABBED) == 0);
-        item_remove(it);
+        item_remove(it, REFCOUNT_CLIENT);
         c->icurr++;
         c->ileft--;
     }
@@ -517,6 +527,10 @@ static void conn_cleanup(conn *c) {
         sasl_dispose(&c->sasl_conn);
         c->sasl_conn = NULL;
     }
+
+#ifdef REF_LEAK_TRACING
+    conn_check_open_refs(c);
+#endif
 
     if (IS_UDP(c->transport)) {
         conn_set_state(c, conn_read);
@@ -939,7 +953,7 @@ static void complete_nread_ascii(conn *c) {
 
     }
 
-    item_remove(c->item);       /* release the c->item reference */
+    item_remove(c->item, REFCOUNT_CLIENT);   /* release the c->item reference */
     c->item = 0;
 }
 
@@ -1161,7 +1175,7 @@ static void complete_incr_bin(conn *c) {
                     write_bin_error(c, PROTOCOL_BINARY_RESPONSE_NOT_STORED,
                                     NULL, 0);
                 }
-                item_remove(it);         /* release our reference */
+                item_remove(it, REFCOUNT_CLIENT);    /* release our reference */
             } else {
                 out_of_memory(c,
                         "SERVER_ERROR Out of memory allocating new item");
@@ -1250,7 +1264,7 @@ static void complete_update_bin(conn *c) {
         write_bin_error(c, eno, NULL, 0);
     }
 
-    item_remove(c->item);       /* release the c->item reference */
+    item_remove(c->item, REFCOUNT_CLIENT);   /* release the c->item reference */
     c->item = 0;
 }
 
@@ -2041,7 +2055,7 @@ static void process_bin_update(conn *c) {
             it = item_get(key, nkey);
             if (it) {
                 item_unlink(it);
-                item_remove(it);
+                item_remove(it, REFCOUNT_CLIENT);
             }
         }
 
@@ -2194,7 +2208,7 @@ static void process_bin_delete(conn *c) {
         } else {
             write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_EEXISTS, NULL, 0);
         }
-        item_remove(it);      /* release our reference */
+        item_remove(it, REFCOUNT_CLIENT);      /* release our reference */
     } else {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, NULL, 0);
         pthread_mutex_lock(&c->thread->stats.mutex);
@@ -2251,7 +2265,7 @@ static void reset_cmd_handler(conn *c) {
     c->cmd = -1;
     c->substate = bin_no_state;
     if(c->item != NULL) {
-        item_remove(c->item);
+        item_remove(c->item, REFCOUNT_CLIENT);
         c->item = NULL;
     }
     conn_shrink(c);
@@ -2353,7 +2367,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
                 if (new_it == NULL) {
                     /* SERVER_ERROR out of memory */
                     if (old_it != NULL)
-                        do_item_remove(old_it);
+                        do_item_remove(old_it, REFCOUNT_CLIENT);
 
                     return NOT_STORED;
                 }
@@ -2386,9 +2400,9 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
     }
 
     if (old_it != NULL)
-        do_item_remove(old_it);         /* release our reference */
+        do_item_remove(old_it, REFCOUNT_CLIENT);   /* release our reference */
     if (new_it != NULL)
-        do_item_remove(new_it);
+        do_item_remove(new_it, REFCOUNT_CLIENT);
 
     if (stored == STORED) {
         c->cas = ITEM_get_cas(it);
@@ -2714,11 +2728,46 @@ static void conn_to_str(const conn *c, char *buf) {
     }
 }
 
+/** Returns the most recent command that was parsed on a conn. */
+static char *conn_current_command(const conn *c, char *buf) {
+    if (!c) {
+        strcpy(buf, "<null conn>");
+        return buf;
+    }
+
+    if (c->protocol == binary_prot) {
+        sprintf(buf, "[binary %02x]", c->cmd);
+        return buf;
+    }
+
+    if (c->rlast) {
+        return c->rlast;
+    }
+
+    return "<none>";
+}
+
+#ifdef REF_LEAK_TRACING
+/** If a conn has open refs, print a diagnostic message. */
+static void conn_check_open_refs(const conn *c) {
+    if (c->num_open_refs) {
+        char conn_name[CONN_TO_STR_BUF_SIZE];
+        char command_buf[sizeof("[binary 02]")];
+        char *command = conn_current_command(c, command_buf);
+
+        conn_to_str(c, conn_name);
+
+        fprintf(stderr, "conn %s has %d open refs, last command %s\n",
+                conn_name, c->num_open_refs, command);
+    }
+}
+#endif
+
 static void process_stats_conns(ADD_STAT add_stats, void *c) {
     int i;
     char key_str[STAT_KEY_LEN];
     char val_str[STAT_VAL_LEN];
-    char conn_name[INET6_ADDRSTRLEN + sizeof("tcp:[]:XXXXX")];
+    char conn_name[CONN_TO_STR_BUF_SIZE];
     int klen = 0, vlen = 0;
 
     assert(add_stats);
@@ -2859,7 +2908,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                         STATS_LOCK();
                         stats.malloc_fails++;
                         STATS_UNLOCK();
-                        item_remove(it);
+                        item_remove(it, REFCOUNT_CLIENT);
                         break;
                     }
                 }
@@ -2887,7 +2936,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                         STATS_LOCK();
                         stats.malloc_fails++;
                         STATS_UNLOCK();
-                        item_remove(it);
+                        item_remove(it, REFCOUNT_CLIENT);
                         break;
                     }
                   }
@@ -2898,9 +2947,9 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                       stats.malloc_fails++;
                       STATS_UNLOCK();
                       out_of_memory(c, "SERVER_ERROR out of memory making CAS suffix");
-                      item_remove(it);
+                      item_remove(it, REFCOUNT_CLIENT);
                       while (i-- > 0) {
-                          item_remove(*(c->ilist + i));
+                          item_remove(*(c->ilist + i), REFCOUNT_CLIENT);
                       }
                       return;
                   }
@@ -2914,7 +2963,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                       add_iov(c, suffix, suffix_len) != 0 ||
                       add_iov(c, ITEM_data(it), it->nbytes) != 0)
                       {
-                          item_remove(it);
+                          item_remove(it, REFCOUNT_CLIENT);
                           break;
                       }
                 }
@@ -2926,7 +2975,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                       add_iov(c, ITEM_key(it), it->nkey) != 0 ||
                       add_iov(c, ITEM_suffix(it), it->nsuffix + it->nbytes) != 0)
                       {
-                          item_remove(it);
+                          item_remove(it, REFCOUNT_CLIENT);
                           break;
                       }
                 }
@@ -3070,7 +3119,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
             it = item_get(key, nkey);
             if (it) {
                 item_unlink(it);
-                item_remove(it);
+                item_remove(it, REFCOUNT_CLIENT);
             }
         }
 
@@ -3117,7 +3166,7 @@ static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
         out_string(c, "TOUCHED");
-        item_remove(it);
+        item_remove(it, REFCOUNT_CLIENT);
     } else {
         pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.touch_cmds++;
@@ -3203,14 +3252,14 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
     }
 
     if (cas != NULL && *cas != 0 && ITEM_get_cas(it) != *cas) {
-        do_item_remove(it);
+        do_item_remove(it, REFCOUNT_CLIENT);
         return DELTA_ITEM_CAS_MISMATCH;
     }
 
     ptr = ITEM_data(it);
 
     if (!safe_strtoull(ptr, &value)) {
-        do_item_remove(it);
+        do_item_remove(it, REFCOUNT_CLIENT);
         return NON_NUMERIC;
     }
 
@@ -3253,7 +3302,7 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
         item *new_it;
         new_it = do_item_alloc(ITEM_key(it), it->nkey, atoi(ITEM_suffix(it) + 1), it->exptime, res + 2, hv);
         if (new_it == 0) {
-            do_item_remove(it);
+            do_item_remove(it, REFCOUNT_CLIENT);
             return EOM;
         }
         memcpy(ITEM_data(new_it), buf, res);
@@ -3262,7 +3311,7 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
         // Overwrite the older item's CAS with our new CAS since we're
         // returning the CAS of the old item below.
         ITEM_set_cas(it, (settings.use_cas) ? ITEM_get_cas(new_it) : 0);
-        do_item_remove(new_it);       /* release our reference */
+        do_item_remove(new_it, REFCOUNT_CLIENT);     /* release our reference */
     } else {
         /* Should never get here. This means we somehow fetched an unlinked
          * item. TODO: Add a counter? */
@@ -3270,14 +3319,14 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
             fprintf(stderr, "Tried to do incr/decr on invalid item\n");
         }
         if (it->refcount == 1)
-            do_item_remove(it);
+            do_item_remove(it, REFCOUNT_CLIENT);
         return DELTA_ITEM_NOT_FOUND;
     }
 
     if (cas) {
         *cas = ITEM_get_cas(it);    /* swap the incoming CAS value */
     }
-    do_item_remove(it);         /* release our reference */
+    do_item_remove(it, REFCOUNT_CLIENT);         /* release our reference */
     return OK;
 }
 
@@ -3322,7 +3371,7 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
         item_unlink(it);
-        item_remove(it);      /* release our reference */
+        item_remove(it, REFCOUNT_CLIENT);      /* release our reference */
         out_string(c, "DELETED");
     } else {
         pthread_mutex_lock(&c->thread->stats.mutex);
@@ -3669,6 +3718,7 @@ static int try_read_command(conn *c) {
         assert(cont <= (c->rcurr + c->rbytes));
 
         c->last_cmd_time = current_time;
+        c->rlast = c->rcurr;
         process_command(c, c->rcurr);
 
         c->rbytes -= (cont - c->rcurr);
@@ -3995,6 +4045,15 @@ static void drive_machine(conn *c) {
             break;
 
         case conn_read:
+#ifdef REF_LEAK_TRACING
+            if (c->num_open_refs) {
+                char conn_name[CONN_TO_STR_BUF_SIZE];
+                conn_to_str(c, conn_name);
+                fprintf(stderr, "conn %s has %d open refs in conn_read\n",
+                        conn_name, c->num_open_refs);
+            }
+#endif
+
             res = IS_UDP(c->transport) ? try_read_udp(c) : try_read_network(c);
 
             switch (res) {
@@ -4195,6 +4254,9 @@ static void drive_machine(conn *c) {
                     /* XXX:  I don't know why this wasn't the general case */
                     if(c->protocol == binary_prot) {
                         conn_set_state(c, c->write_and_go);
+#ifdef REF_LEAK_TRACING
+                        conn_check_open_refs(c);
+#endif
                     } else {
                         conn_set_state(c, conn_new_cmd);
                     }
@@ -4204,6 +4266,9 @@ static void drive_machine(conn *c) {
                         c->write_and_free = 0;
                     }
                     conn_set_state(c, c->write_and_go);
+#ifdef REF_LEAK_TRACING
+                    conn_check_open_refs(c);
+#endif
                 } else {
                     if (settings.verbose > 0)
                         fprintf(stderr, "Unexpected state %d\n", c->state);

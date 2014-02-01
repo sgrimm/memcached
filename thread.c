@@ -84,7 +84,21 @@ static pthread_cond_t init_cond;
 
 static void thread_libevent_process(int fd, short which, void *arg);
 
-unsigned short refcount_incr(unsigned short *refcount) {
+unsigned short refcount_incr(item *it, enum refcount_type type) {
+    unsigned short *refcount = &it->refcount;
+
+#ifdef REF_LEAK_TRACING
+    if (type == REFCOUNT_CLIENT) {
+        conn *c = thread_get_conn();
+        if (c) {
+            c->num_open_refs++;
+        } else {
+            fprintf(stderr, "Incrementing ref count on %s with no conn\n",
+                    ITEM_key(it));
+        }
+    }
+#endif
+
 #ifdef HAVE_GCC_ATOMICS
     return __sync_add_and_fetch(refcount, 1);
 #elif defined(__sun)
@@ -99,7 +113,21 @@ unsigned short refcount_incr(unsigned short *refcount) {
 #endif
 }
 
-unsigned short refcount_decr(unsigned short *refcount) {
+unsigned short refcount_decr(item *it, enum refcount_type type) {
+    unsigned short *refcount = &it->refcount;
+
+#ifdef REF_LEAK_TRACING
+    if (type == REFCOUNT_CLIENT) {
+        conn *c = thread_get_conn();
+        if (c) {
+            c->num_open_refs--;
+        } else {
+            fprintf(stderr, "Decrementing ref count on %s with no conn\n",
+                    ITEM_key(it));
+        }
+    }
+#endif
+
 #ifdef HAVE_GCC_ATOMICS
     return __sync_sub_and_fetch(refcount, 1);
 #elif defined(__sun)
@@ -554,12 +582,12 @@ int item_link(item *item) {
  * Decrements the reference count on an item and adds it to the freelist if
  * needed.
  */
-void item_remove(item *item) {
+void item_remove(item *item, enum refcount_type type) {
     uint32_t hv;
     hv = hash(ITEM_key(item), item->nkey, 0);
 
     item_lock(hv);
-    do_item_remove(item);
+    do_item_remove(item, type);
     item_unlock(hv);
 }
 

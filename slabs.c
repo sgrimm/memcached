@@ -524,7 +524,7 @@ static int slab_rebalance_move(void) {
             if ((hold_lock = item_trylock(hv)) == NULL) {
                 status = MOVE_LOCKED;
             } else {
-                refcount = refcount_incr(&it->refcount);
+                refcount = refcount_incr(it, REFCOUNT_HASHTABLE);
                 if (refcount == 1) { /* item is unlinked, unused */
                     if (it->it_flags & ITEM_SLABBED) {
                         /* remove from slab freelist */
@@ -561,12 +561,18 @@ static int slab_rebalance_move(void) {
 
         switch (status) {
             case MOVE_DONE:
-                it->refcount = 0;
+                refcount = refcount_decr(it, REFCOUNT_HASHTABLE);
+                if (refcount) {
+                    fprintf(stderr, "Unexpected ref count %d after rebalance\n",
+                            refcount);
+                    // Not clear if this will help or make things worse.
+                    it->refcount = 0;
+                }
                 it->it_flags = 0;
                 it->slabs_clsid = 255;
                 break;
             case MOVE_BUSY:
-                refcount_decr(&it->refcount);
+                refcount_decr(it, REFCOUNT_HASHTABLE);
             case MOVE_LOCKED:
                 slab_rebal.busy_items++;
                 was_busy++;
