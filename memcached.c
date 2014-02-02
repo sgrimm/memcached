@@ -2787,6 +2787,9 @@ static void process_stats_conns(ADD_STAT add_stats, void *c) {
                         state_text(conns[i]->state));
                 APPEND_NUM_STAT(i, "secs_since_last_cmd", "%d",
                         current_time - conns[i]->last_cmd_time);
+#ifdef REF_LEAK_TRACING
+                APPEND_NUM_STAT(i, "open_refs", "%d", conns[i]->num_open_refs);
+#endif
             }
         }
     }
